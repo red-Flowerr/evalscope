@@ -291,6 +291,21 @@ evalscope eval \
 
 详情请参考 [📖 全部参数说明](https://evalscope.readthedocs.io/zh-cn/latest/get_started/parameters.html)。
 
+### Token Entropy 报告
+
+开启 `--observe-entropy` 后，可以在评测完成后查看模型输出的 token 不确定性：
+
+```shell
+evalscope eval \
+ --model Qwen/Qwen2.5-0.5B-Instruct \
+ --datasets aime24 \
+ --observe-entropy \
+ --entropy-include-prompt \
+ --entropy-max-samples 50
+```
+
+该模式会自动请求 logprobs（并关闭流式输出），并在 `outputs/<时间戳>/reports/<model_id>/entropy/<benchmark>/` 目录下生成 JSONL 与 HTML 报告。
+
 ### 评测在线模型 API
 
 EvalScope 支持评测通过 API 部署的模型服务（如 vLLM 部署的服务）。只需指定服务地址和 API Key 即可。

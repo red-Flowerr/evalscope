@@ -67,12 +67,21 @@ def add_argument(parser: argparse.ArgumentParser):
     parser.add_argument('--eval-batch-size', type=int, default=1, help='The batch size for evaluation.')
     parser.add_argument('--limit', type=float, default=None, help='Max evaluation samples num for each subset.')
     parser.add_argument('--repeats', type=int, default=1, help='Number of times to repeat the dataset items for k-metrics.')  # noqa: E501
+    parser.add_argument('--observe-entropy', action='store_true', default=False,
+                        help='Collect per-token entropy statistics and generate HTML reports after evaluation.')
+    parser.add_argument('--entropy-include-prompt', action='store_true', default=False,
+                        help='Include prompts in entropy reports (disabled by default).')
+    parser.add_argument('--entropy-max-samples', type=int, default=None,
+                        help='Maximum number of samples per subset to include in entropy reports.')
+    parser.add_argument('--entropy-top-logprobs', type=int, default=5,
+                        help='Minimum top_logprobs requested when observing entropy.')
 
     # Cache and working directory arguments
     parser.add_argument('--use-cache', type=str, help='Path to reuse the cached results.')
     parser.add_argument('--rerun-review', action='store_true', default=False, help='Rerun the review process when use_cache.')
     parser.add_argument('--work-dir', type=str, help='The root cache dir.')
-    parser.add_argument('--no-timestamp', action='store_false', help='Do not add timestamp to work_dir to avoid overwriting previous results.')  # noqa: E501
+    parser.add_argument('--no-timestamp', action='store_true', default=False,
+                        help='Do not add timestamp to work_dir to avoid overwriting previous results.')  # noqa: E501
 
     # Debug and runtime mode arguments
     parser.add_argument('--ignore-errors', action='store_true', default=False, help='Ignore errors during evaluation.')

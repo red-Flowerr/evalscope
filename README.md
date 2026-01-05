@@ -292,6 +292,21 @@ evalscope eval \
 
 For details, please refer to [📖 Complete Parameter Guide](https://evalscope.readthedocs.io/en/latest/get_started/parameters.html).
 
+### Token Entropy Reports
+
+Enable per-token entropy tracking to inspect uncertainty after each evaluation:
+
+```shell
+evalscope eval \
+ --model Qwen/Qwen2.5-0.5B-Instruct \
+ --datasets aime24 \
+ --observe-entropy \
+ --entropy-include-prompt \
+ --entropy-max-samples 50
+```
+
+This automatically requests logprobs from the backend (streaming is disabled) and produces JSONL/HTML reports under `outputs/<timestamp>/reports/<model_id>/entropy/<benchmark>/`.
+
 ### Evaluating Online Model APIs
 
 EvalScope supports evaluating model services deployed via APIs (such as services deployed with vLLM). Simply specify the service address and API Key.

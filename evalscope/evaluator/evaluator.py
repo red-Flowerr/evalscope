@@ -8,6 +8,7 @@ and report generation.
 """
 
 import os
+from pathlib import Path
 import traceback
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Dict, List
@@ -78,6 +79,21 @@ class DefaultEvaluator(Evaluator):
             benchmark_name=self.benchmark_name,
         )
 
+        self._entropy_reporter = None
+        if getattr(task_config, 'observe_entropy', False):
+            try:
+                from evalscope.entropy import EntropyReportBuilder
+                entropy_dir = Path(self.outputs.reports_dir) / self.model_name / 'entropy' / self.benchmark_name
+                self._entropy_reporter = EntropyReportBuilder(
+                    base_dir=entropy_dir,
+                    benchmark_name=self.benchmark_name,
+                    include_prompt=task_config.entropy_include_prompt,
+                    max_samples=task_config.entropy_max_samples,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f'Failed to initialize entropy reporter: {exc}')
+                self._entropy_reporter = None
+
     def eval(self) -> Report:
         """
         Run the complete evaluation process.
@@ -137,6 +153,9 @@ class DefaultEvaluator(Evaluator):
         # Get model predictions for all samples in the subset
         logger.info(f'Getting predictions for subset: {subset}')
         task_states = self.get_answers(subset, dataset)
+
+        if self._entropy_reporter:
+            self._entropy_reporter.add_task_states(subset, task_states)
 
         # Calculate evaluation metrics for each prediction
         logger.info(f'Getting reviews for subset: {subset}')
@@ -393,4 +412,6 @@ class DefaultEvaluator(Evaluator):
         return report
 
     def finalize(self, *args, **kwargs):
+        if self._entropy_reporter:
+            self._entropy_reporter.finalize()
         self.benchmark.finalize(*args, **kwargs)

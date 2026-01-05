@@ -156,6 +156,18 @@ class TaskConfig(BaseArgument):
     analysis_report: bool = False
     """Whether to generate detailed analysis reports after evaluation."""
 
+    observe_entropy: bool = False
+    """Whether to collect token-level entropy information for model outputs."""
+
+    entropy_include_prompt: bool = False
+    """Include prompt content in the entropy HTML report."""
+
+    entropy_max_samples: Optional[int] = None
+    """Maximum number of samples per subset to include in entropy reports."""
+
+    entropy_top_logprobs: Optional[int] = 5
+    """Minimum top_logprobs value requested when entropy observation is enabled."""
+
     # Sandbox configuration arguments
     use_sandbox: bool = False
     """Whether to execute code in a sandboxed environment."""
@@ -229,6 +241,20 @@ class TaskConfig(BaseArgument):
 
         # 4. Handle deprecations
         self._handle_generation_config_deprecations()
+
+        if self.observe_entropy:
+            self.generation_config.logprobs = True
+            if self.generation_config.stream:
+                logger.warning('Token entropy tracking requires disable stream; forcing stream=False.')
+            self.generation_config.stream = False
+            top_k = self.entropy_top_logprobs if self.entropy_top_logprobs is not None else 5
+            top_k = max(1, int(top_k))
+            if self.generation_config.top_logprobs is None:
+                self.generation_config.top_logprobs = top_k
+            else:
+                existing = int(self.generation_config.top_logprobs)
+                if existing < top_k:
+                    self.generation_config.top_logprobs = top_k
 
     def _get_default_generation_config(self) -> Dict:
         if self.model_task == ModelTask.IMAGE_GENERATION:
