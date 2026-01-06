@@ -175,26 +175,30 @@ def segment_tokens(
     current_type: Optional[str] = None
     start_index: Optional[int] = None
     last_index: int = -1
+    current_tooltips: List[Optional[str]] = []
 
     def flush(end_index: int) -> None:
-        nonlocal current_tokens, current_entropies, current_categories, current_type, start_index
+        nonlocal current_tokens, current_entropies, current_categories, current_type, start_index, current_tooltips
         if not current_tokens or current_type is None or start_index is None:
             current_tokens = []
             current_entropies = []
             current_categories = []
             current_type = None
             start_index = None
+            current_tooltips = []
             return
 
         segments.append({
             'type': current_type,
             'text': ''.join(current_tokens),
+            'tooltip': '; '.join(t for t in current_tooltips if t) if current_tooltips else None,
         })
         current_tokens = []
         current_entropies = []
         current_categories = []
         current_type = None
         start_index = None
+        current_tooltips = []
 
     for idx, token in enumerate(tokens):
         last_index = idx
@@ -224,6 +228,13 @@ def segment_tokens(
         current_tokens.append(token_text)
         current_entropies.append(entropy)
         current_categories.append(category or 'unknown')
+        tooltip_items = []
+        if seg_type in ('high', 'synonym'):
+            alternates = extract_alternates(token)
+            if alternates:
+                tooltip_items = [normalize_token(token_text) or token_text]
+                tooltip_items.extend(alternates[:5])
+        current_tooltips.append(', '.join(tooltip_items) if tooltip_items else None)
 
     if last_index >= 0:
         flush(last_index)
@@ -320,7 +331,14 @@ def process_observations(
                 seg_type = html.escape(segment.get('type', 'unknown'))
                 seg_text = segment.get('text', '')
                 seg_html = html.escape(seg_text)
-                writer.write(f"<span class='segment {seg_type}'>{seg_html}</span>")
+                tooltip = segment.get('tooltip')
+                if tooltip:
+                    tooltip_html = html.escape(tooltip)
+                    writer.write(
+                        f"<span class='segment {seg_type}' title='{tooltip_html}'>{seg_html}</span>"
+                    )
+                else:
+                    writer.write(f"<span class='segment {seg_type}'>{seg_html}</span>")
             writer.write("</div></section>")
         writer.write("</body></html>")
 
