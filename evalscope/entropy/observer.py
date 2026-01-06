@@ -326,6 +326,7 @@ class EntropyReportBuilder:
             'fraction_high_entropy_tokens',
             'fraction_zero_entropy_tokens',
             'fraction_code_tokens',
+            'code_token_count',
         ]
 
         ranked = sorted(
@@ -566,6 +567,7 @@ class EntropyReportBuilder:
                 ('fraction_high_entropy_tokens', 'Fraction of tokens ≥ 1.0 entropy'),
                 ('fraction_zero_entropy_tokens', 'Fraction of zero-entropy tokens'),
                 ('fraction_code_tokens', 'Fraction of code tokens'),
+                ('code_token_count', 'Code token count'),
             ]
             for key, label in summary_metrics:
                 stat = stats.get(key)
