@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from evalscope.api.evaluator.state import TaskState
 from evalscope.api.model.model_output import Logprob
 from evalscope.utils.io_utils import safe_filename
 from evalscope.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from evalscope.api.metric.scorer import SampleScore
 
 logger = get_logger()
 
@@ -36,6 +40,8 @@ class Observation:
     response_text: str
     tokens: List[LLMToken]
     metadata: Dict[str, Any]
+    score: Optional[Dict[str, Any]] = None
+    token_categories: Optional[List[str]] = None
 
     def to_json_dict(self) -> Dict[str, Any]:
         return {
@@ -43,6 +49,8 @@ class Observation:
             'response': self.response_text,
             'metrics': self.metrics,
             'metadata': self.metadata,
+            'score': self.score,
+            'token_categories': self.token_categories,
             'tokens': [
                 {
                     'text': token.text,
@@ -71,13 +79,40 @@ def compute_entropy_metrics(generation: LLMGeneration) -> Dict[str, Any]:
         return {
             'mean_token_entropy': None,
             'max_token_entropy': None,
+            'min_token_entropy': None,
+            'median_token_entropy': None,
+            'std_token_entropy': None,
+            'p75_token_entropy': None,
+            'p90_token_entropy': None,
+            'fraction_high_entropy_tokens': None,
+            'fraction_zero_entropy_tokens': None,
             'token_entropies': per_token_entropies,
         }
 
     mean_entropy = sum(numeric_entropies) / len(numeric_entropies)
+    max_entropy = max(numeric_entropies)
+    min_entropy = min(numeric_entropies)
+    median_entropy = statistics.median(numeric_entropies)
+    std_entropy = statistics.pstdev(numeric_entropies) if len(numeric_entropies) > 1 else 0.0
+    p75_entropy = _percentile(numeric_entropies, 0.75)
+    p90_entropy = _percentile(numeric_entropies, 0.90)
+    high_threshold = 1.0
+    high_count = sum(1 for value in numeric_entropies if value >= high_threshold)
+    zero_count = sum(1 for value in numeric_entropies if math.isclose(value, 0.0, abs_tol=1e-9))
+    total = len(numeric_entropies)
+    fraction_high = high_count / total if total else 0.0
+    fraction_zero = zero_count / total if total else 0.0
+
     return {
         'mean_token_entropy': mean_entropy,
-        'max_token_entropy': max(numeric_entropies),
+        'max_token_entropy': max_entropy,
+        'min_token_entropy': min_entropy,
+        'median_token_entropy': median_entropy,
+        'std_token_entropy': std_entropy,
+        'p75_token_entropy': p75_entropy,
+        'p90_token_entropy': p90_entropy,
+        'fraction_high_entropy_tokens': fraction_high,
+        'fraction_zero_entropy_tokens': fraction_zero,
         'token_entropies': per_token_entropies,
     }
 
@@ -98,6 +133,50 @@ def _token_entropy(token: LLMToken) -> Optional[float]:
         return None
 
     return -sum(prob * math.log(prob) for prob in normalized)
+
+
+def _percentile(values: List[float], q: float) -> float:
+    if not values:
+        return math.nan
+    if q <= 0:
+        return min(values)
+    if q >= 1:
+        return max(values)
+    sorted_values = sorted(values)
+    idx = (len(sorted_values) - 1) * q
+    lower = math.floor(idx)
+    upper = math.ceil(idx)
+    if lower == upper:
+        return sorted_values[int(idx)]
+    fraction = idx - lower
+    return sorted_values[lower] * (1 - fraction) + sorted_values[upper] * fraction
+
+
+def _categorize_tokens(tokens: List[LLMToken]) -> tuple[List[str], float, int]:
+    categories: List[str] = []
+    code_mode = False
+    code_count = 0
+    total_non_special = 0
+
+    for token in tokens:
+        text = token.text or ''
+        if token.is_special:
+            categories.append('special')
+            continue
+
+        if '```' in text:
+            categories.append('code-fence')
+            code_mode = not code_mode
+            continue
+
+        category = 'code' if code_mode else 'text'
+        categories.append(category)
+        total_non_special += 1
+        if category == 'code':
+            code_count += 1
+
+    fraction_code = code_count / total_non_special if total_non_special else 0.0
+    return categories, fraction_code, code_count
 
 
 class EntropyReportBuilder:
@@ -126,6 +205,39 @@ class EntropyReportBuilder:
                 self._missing_logprobs += 1
                 continue
             bucket.append(observation)
+
+    def update_scores(self, subset: str, sample_scores: Sequence['SampleScore']) -> None:
+        """
+        Attach review scores to existing observations so downstream HTML can surface correctness.
+        """
+        if not sample_scores:
+            return
+        observations = self._records.get(subset)
+        if not observations:
+            return
+
+        lookup = {obs.record_id: obs for obs in observations}
+        for sample_score in sample_scores:
+            if sample_score is None or sample_score.score is None:
+                continue
+
+            record_id = str(sample_score.sample_id)
+            observation = lookup.get(record_id)
+            if observation is None:
+                continue
+
+            score_obj = sample_score.score
+            try:
+                main_value = score_obj.main_value
+            except Exception:
+                main_value = None
+
+            observation.score = {
+                'values': dict(score_obj.value),
+                'main_name': score_obj.main_score_name,
+                'main_value': main_value,
+                'explanation': score_obj.explanation,
+            }
 
     def finalize(self) -> Optional[Dict[str, Any]]:
         if not self._records:
@@ -189,7 +301,7 @@ class EntropyReportBuilder:
             values: List[float] = []
             for obs in observations:
                 value = obs.metrics.get(key)
-                if value is not None:
+                if isinstance(value, (int, float)) and math.isfinite(value):
                     values.append(value)
             return values
 
@@ -203,6 +315,19 @@ class EntropyReportBuilder:
                 'max': values_sorted[-1],
             }
 
+        metric_keys = [
+            'mean_token_entropy',
+            'median_token_entropy',
+            'max_token_entropy',
+            'min_token_entropy',
+            'std_token_entropy',
+            'p75_token_entropy',
+            'p90_token_entropy',
+            'fraction_high_entropy_tokens',
+            'fraction_zero_entropy_tokens',
+            'fraction_code_tokens',
+        ]
+
         ranked = sorted(
             [
                 (obs.record_id, obs.metrics.get('mean_token_entropy'))
@@ -213,11 +338,88 @@ class EntropyReportBuilder:
             reverse=True,
         )
 
+        summary: Dict[str, Any] = {key: summarize(collect(key)) for key in metric_keys}
+        summary['highest_mean_entropy_samples'] = ranked[:5]
+        return summary
+
+    def _score_status(self, observation: Observation) -> Dict[str, Any]:
+        info = observation.score or {}
+        if not info:
+            return {
+                'badge_text': 'N/A',
+                'badge_class': 'status-unknown',
+                'status_bool': None,
+                'main_name': None,
+                'main_value': None,
+                'values': {},
+                'explanation': None,
+            }
+
+        values = info.get('values') or {}
+        main_value = info.get('main_value')
+        main_name = info.get('main_name') or info.get('main_score_name')
+
+        status_bool = None
+        bool_value = next((v for v in values.values() if isinstance(v, bool)), None)
+        if bool_value is not None:
+            status_bool = bool_value
+        elif isinstance(main_value, bool):
+            status_bool = main_value
+        elif isinstance(main_value, (int, float)) and math.isfinite(main_value):
+            if math.isclose(main_value, 1.0):
+                status_bool = True
+            elif math.isclose(main_value, 0.0):
+                status_bool = False
+            elif 0 <= main_value <= 1:
+                status_bool = main_value >= 0.5
+
+        badge_class = 'status-unknown'
+        badge_text = 'N/A'
+        if status_bool is True:
+            badge_class = 'status-correct'
+            badge_text = 'Correct'
+        elif status_bool is False:
+            badge_class = 'status-incorrect'
+            badge_text = 'Incorrect'
+        else:
+            if isinstance(main_value, (int, float)) and math.isfinite(main_value):
+                badge_text = f'{main_value:.4f}'
+
         return {
-            'mean_token_entropy': summarize(collect('mean_token_entropy')),
-            'max_token_entropy': summarize(collect('max_token_entropy')),
-            'highest_mean_entropy_samples': ranked[:5],
+            'badge_text': badge_text,
+            'badge_class': badge_class,
+            'status_bool': status_bool,
+            'main_name': main_name,
+            'main_value': main_value,
+            'values': values,
+            'explanation': info.get('explanation'),
         }
+
+    @staticmethod
+    def _format_metric_value(value: Any) -> str:
+        if value is None:
+            return 'N/A'
+        if isinstance(value, float):
+            if math.isnan(value):
+                return 'nan'
+            return f'{value:.4f}'
+        return str(value)
+
+    @staticmethod
+    def _format_stat_summary(stat: Optional[Dict[str, float]]) -> str:
+        if not stat:
+            return 'N/A'
+        mean = stat.get('mean')
+        min_value = stat.get('min')
+        max_value = stat.get('max')
+        parts = []
+        if mean is not None:
+            parts.append(f'mean {mean:.4f}')
+        if min_value is not None:
+            parts.append(f'min {min_value:.4f}')
+        if max_value is not None:
+            parts.append(f'max {max_value:.4f}')
+        return ' · '.join(parts) if parts else 'N/A'
 
     def _build_observation(self, task_state: TaskState) -> Optional[Observation]:
         output = task_state.output
@@ -250,6 +452,9 @@ class EntropyReportBuilder:
             tokens=tokens,
         )
         metrics = compute_entropy_metrics(generation)
+        token_categories, code_fraction, code_count = _categorize_tokens(tokens)
+        metrics['fraction_code_tokens'] = code_fraction
+        metrics['code_token_count'] = code_count
         target_obj = task_state.target
         if hasattr(target_obj, 'text'):
             target_text = target_obj.text
@@ -275,6 +480,7 @@ class EntropyReportBuilder:
             response_text=generation.text,
             tokens=tokens,
             metadata=metadata,
+            token_categories=token_categories,
         )
 
     def _write_observation_pages(
@@ -291,6 +497,7 @@ class EntropyReportBuilder:
             slug = safe_filename(record_id_value) or f'sample_{idx}'
             filename = f'{idx:03d}_{slug}.html'
             html_path = subset_dir / filename
+            status_info = self._score_status(observation)
             self._write_single_observation_html(
                 html_path=html_path,
                 subset=subset,
@@ -298,8 +505,15 @@ class EntropyReportBuilder:
                 position=idx,
                 total=total,
                 stats=stats,
+                status_info=status_info,
             )
-            html_files.append({'record_id': observation.record_id, 'html_path': str(html_path)})
+            html_files.append(
+                {
+                    'record_id': observation.record_id,
+                    'html_path': str(html_path),
+                    'status': status_info,
+                }
+            )
         return html_files
 
     def _write_index_page(
@@ -310,8 +524,6 @@ class EntropyReportBuilder:
         html_files: List[Dict[str, str]],
     ) -> None:
         index_path.parent.mkdir(parents=True, exist_ok=True)
-        mean_stats = stats.get('mean_token_entropy')
-        max_stats = stats.get('max_token_entropy')
         top_samples = stats.get('highest_mean_entropy_samples') or []
 
         with index_path.open('w', encoding='utf-8') as handle:
@@ -331,6 +543,11 @@ class EntropyReportBuilder:
                 ".list tr:hover{background:#f8faff;}"
                 "a{color:#2a4bd7;text-decoration:none;}"
                 "a:hover{text-decoration:underline;}"
+                ".status-badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;}"
+                ".status-correct{background:#e7f6ed;color:#0f8b2c;}"
+                ".status-incorrect{background:#fde7e7;color:#d93025;}"
+                ".status-unknown{background:#eef1ff;color:#55628e;}"
+                ".status-detail{font-size:11px;color:#5a688f;margin-top:4px;}"
                 "</style></head><body>"
             )
             handle.write(
@@ -338,14 +555,21 @@ class EntropyReportBuilder:
             )
             handle.write("<section class='summary'><h2>Summary</h2><ul>")
             handle.write(f"<li>Total samples: {len(html_files)}</li>")
-            handle.write(
-                f"<li>Mean token entropy avg: {mean_stats['mean']:.4f}</li>"
-                if mean_stats else "<li>Mean token entropy: N/A</li>"
-            )
-            handle.write(
-                f"<li>Max token entropy avg: {max_stats['mean']:.4f}</li>"
-                if max_stats else "<li>Max token entropy: N/A</li>"
-            )
+            summary_metrics = [
+                ('mean_token_entropy', 'Mean token entropy'),
+                ('median_token_entropy', 'Median token entropy'),
+                ('max_token_entropy', 'Max token entropy'),
+                ('min_token_entropy', 'Min token entropy'),
+                ('std_token_entropy', 'Std token entropy'),
+                ('p75_token_entropy', '75th percentile entropy'),
+                ('p90_token_entropy', '90th percentile entropy'),
+                ('fraction_high_entropy_tokens', 'Fraction of tokens ≥ 1.0 entropy'),
+                ('fraction_zero_entropy_tokens', 'Fraction of zero-entropy tokens'),
+                ('fraction_code_tokens', 'Fraction of code tokens'),
+            ]
+            for key, label in summary_metrics:
+                stat = stats.get(key)
+                handle.write(f"<li>{label}: {self._format_stat_summary(stat)}</li>")
             if top_samples:
                 formatted = ', '.join(
                     f"{escape(sample_id)} ({value:.4f})"
@@ -359,12 +583,22 @@ class EntropyReportBuilder:
             handle.write("</ul></section>")
 
             handle.write("<section class='list'><h2>Samples</h2><table>")
-            handle.write("<tr><th>#</th><th>Record ID</th><th>Report</th></tr>")
+            handle.write("<tr><th>#</th><th>Record ID</th><th>Result</th><th>Report</th></tr>")
             for idx, item in enumerate(html_files, start=1):
                 record_id = item['record_id'] or f'Sample {idx}'
                 rel_path = Path(item['html_path']).name
+                status_info = item.get('status') or {}
+                badge_text = escape(str(status_info.get('badge_text', 'N/A')))
+                badge_class = status_info.get('badge_class', 'status-unknown')
+                main_name = status_info.get('main_name')
+                main_value = status_info.get('main_value')
+                detail = ''
+                if main_name and main_value is not None:
+                    detail_value = escape(self._format_metric_value(main_value))
+                    detail = f"<div class='status-detail'>{escape(str(main_name))}: {detail_value}</div>"
                 handle.write(
                     f"<tr><td>{idx}</td><td>{escape(str(record_id))}</td>"
+                    f"<td><span class='status-badge {badge_class}'>{badge_text}</span>{detail}</td>"
                     f"<td><a href='{escape(rel_path)}' target='_blank'>Open report</a></td></tr>"
                 )
             handle.write("</table></section>")
@@ -379,6 +613,7 @@ class EntropyReportBuilder:
         position: int,
         total: int,
         stats: Dict[str, Any],
+        status_info: Dict[str, Any],
     ) -> None:
         html_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -388,7 +623,10 @@ class EntropyReportBuilder:
         display_tokens: List[Dict[str, Any]] = []
         row_index = 0
         for idx, token in enumerate(observation.tokens):
-            if token.is_special:
+            category = 'text'
+            if observation.token_categories and idx < len(observation.token_categories):
+                category = observation.token_categories[idx] or 'text'
+            if token.is_special or category == 'special':
                 continue
             row_index += 1
             entropy_value = entropies[idx] if idx < len(entropies) else None
@@ -450,6 +688,7 @@ class EntropyReportBuilder:
                     'chip_style': chip_style,
                     'tooltip_html': tooltip_html,
                     'title_attr': title_attr,
+                    'category': category,
                 }
             )
 
@@ -467,8 +706,8 @@ class EntropyReportBuilder:
                 ".prompt-block{margin-bottom:16px;padding:14px 16px;border:1px solid #dfe4f6;border-radius:8px;background:#f8faff;}"
                 ".prompt-label{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:#4a5c91;margin-bottom:8px;display:block;}"
                 ".prompt-text{white-space:pre-wrap;font-family:monospace;font-size:13px;line-height:1.5;color:#1f2d4d;}"
-                ".response-stream{white-space:pre-wrap;font-family:monospace;font-size:13px;line-height:1.6;background:#fff;border:1px solid #e3e8f8;border-radius:8px;padding:16px;color:#19213b;}"
-                ".response-token{display:inline;white-space:pre;border-radius:4px;padding:2px 3px;margin:0 1px;transition:box-shadow 0.1s ease,transform 0.1s ease;color:inherit;position:relative;}"
+                ".response-stream{white-space:pre-wrap;font-family:monospace;font-size:13px;line-height:1.6;background:#fff;border:1px solid #e3e8f8;border-radius:8px;padding:16px;color:#19213b;word-break:break-word;overflow-wrap:anywhere;}"
+                ".response-token{display:inline-block;white-space:pre-wrap;border-radius:4px;padding:2px 3px;margin:0 1px;transition:box-shadow 0.1s ease,transform 0.1s ease;color:inherit;position:relative;word-break:break-word;overflow-wrap:anywhere;}"
                 ".response-token:hover{box-shadow:0 4px 12px rgba(31,37,48,0.18);transform:translateY(-1px);z-index:2;}"
                 ".response-token.whitespace{margin:0;}"
                 ".response-token .tooltip{position:absolute;left:0;bottom:100%;transform:translateY(-6px);background:#1f2530;color:#f8f9ff;padding:8px 10px;border-radius:6px;font-size:12px;line-height:1.45;white-space:normal;box-shadow:0 8px 18px rgba(15,23,42,0.3);opacity:0;visibility:hidden;pointer-events:none;min-width:220px;max-width:320px;}"
@@ -480,6 +719,25 @@ class EntropyReportBuilder:
                 ".tooltip-logprobs{display:flex;flex-direction:column;gap:2px;}"
                 ".tooltip-logprob-row{display:flex;justify-content:space-between;gap:12px;font-family:monospace;font-size:12px;color:#fefefe;}"
                 ".tooltip-empty{font-style:italic;color:rgba(248,249,255,0.7);}"
+                ".status-badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;}"
+                ".status-correct{background:#e7f6ed;color:#0f8b2c;}"
+                ".status-incorrect{background:#fde7e7;color:#d93025;}"
+                ".status-unknown{background:#eef1ff;color:#55628e;}"
+                ".status-detail{font-size:12px;color:#5a688f;}"
+                ".score-summary{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-bottom:18px;padding:16px;border:1px solid #dfe4f6;border-radius:10px;background:#fff;}"
+                ".score-metrics{list-style:none;padding:0;margin:0;display:flex;flex-wrap:wrap;gap:8px;font-size:12px;color:#3b4b7a;}"
+                ".score-metrics li{background:#eef1ff;border-radius:6px;padding:4px 8px;}"
+                ".score-metrics .metric-name{font-weight:600;margin-right:6px;}"
+                ".score-explanation{font-size:12px;color:#5a688f;margin-top:8px;white-space:pre-wrap;}"
+                ".response-token.code{box-shadow:inset 0 -2px 0 rgba(15,139,44,0.45);}"
+                ".response-token.code-fence{background:#fff3cd;color:#8a6d3b;font-weight:600;}"
+                ".response-token.special{opacity:0.6;}"
+                ".legend{font-size:11px;color:#5a688f;margin-bottom:12px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;}"
+                ".legend-item{display:inline-flex;align-items:center;gap:6px;padding:4px 6px;border-radius:6px;background:#eef1ff;}"
+                ".legend-swatch{width:14px;height:6px;border-radius:999px;display:inline-block;}"
+                ".legend-code{background:rgba(15,139,44,0.6);}"
+                ".legend-text{background:rgba(49,65,111,0.45);}"
+                ".legend-fence{background:#fff3cd;border:1px solid #f0c36d;}"
                 "</style></head><body>"
             )
             handle.write(
@@ -489,15 +747,64 @@ class EntropyReportBuilder:
                 f"<h1>{escape(self.benchmark_name)} · {escape(subset or 'default')} · Sample {escape(str(observation.record_id))}</h1>"
             )
 
-            mean_entropy = observation.metrics.get('mean_token_entropy')
-            max_entropy_value = observation.metrics.get('max_token_entropy')
-            if mean_entropy is not None and max_entropy_value is not None:
-                metric_line = (
-                    f"Mean token entropy: {mean_entropy:.4f} · "
-                    f"Max token entropy: {max_entropy_value:.4f}"
-                )
+            badge_text = escape(str(status_info.get('badge_text', 'N/A')))
+            badge_class = status_info.get('badge_class', 'status-unknown')
+            main_name = status_info.get('main_name')
+            main_value = status_info.get('main_value')
+            explanation = status_info.get('explanation')
+            values_dict = status_info.get('values') or {}
+
+            if main_name and main_value is not None:
+                detail_text = f"<div class='status-detail'>{escape(str(main_name))}: {escape(self._format_metric_value(main_value))}</div>"
             else:
-                metric_line = "Mean token entropy: N/A · Max token entropy: N/A"
+                detail_text = ""
+
+            metrics_list_html = "".join(
+                f"<li><span class='metric-name'>{escape(str(k))}</span>"
+                f"<span class='metric-value'>{escape(self._format_metric_value(v))}</span></li>"
+                for k, v in values_dict.items()
+            )
+            explanation_html = (
+                f"<div class='score-explanation'>{escape(str(explanation))}</div>" if explanation else ""
+            )
+
+            handle.write("<section class='score-summary'>")
+            handle.write(f"<span class='status-badge {badge_class}'>{badge_text}</span>")
+            if detail_text:
+                handle.write(detail_text)
+            if metrics_list_html:
+                handle.write(f"<ul class='score-metrics'>{metrics_list_html}</ul>")
+            if explanation_html:
+                handle.write(explanation_html)
+            handle.write("</section>")
+            handle.write(
+                "<div class='legend'>"
+                "<span class='legend-item'><span class='legend-swatch legend-text'></span>Text token</span>"
+                "<span class='legend-item'><span class='legend-swatch legend-code'></span>Code token</span>"
+                "<span class='legend-item'><span class='legend-swatch legend-fence'></span>Code fence</span>"
+                "</div>"
+            )
+
+            metric_line_parts = []
+            per_sample_metrics = {
+                'Mean': observation.metrics.get('mean_token_entropy'),
+                'Median': observation.metrics.get('median_token_entropy'),
+                'Std': observation.metrics.get('std_token_entropy'),
+                'Min': observation.metrics.get('min_token_entropy'),
+                'Max': observation.metrics.get('max_token_entropy'),
+                'P75': observation.metrics.get('p75_token_entropy'),
+                'P90': observation.metrics.get('p90_token_entropy'),
+                'Frac ≥1.0': observation.metrics.get('fraction_high_entropy_tokens'),
+                'Frac =0': observation.metrics.get('fraction_zero_entropy_tokens'),
+                'Code frac': observation.metrics.get('fraction_code_tokens'),
+            }
+            for label, value in per_sample_metrics.items():
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    metric_line_parts.append(f"{label}: {value:.4f}")
+            code_token_count = observation.metrics.get('code_token_count')
+            if isinstance(code_token_count, (int, float)) and code_token_count:
+                metric_line_parts.append(f"Code tokens: {int(code_token_count)}")
+            metric_line = " · ".join(metric_line_parts) if metric_line_parts else "Entropy metrics unavailable."
             handle.write(f"<div class='metric-line'>{metric_line}</div>")
 
             prompt_text = observation.metadata.get('prompt')
@@ -512,8 +819,16 @@ class EntropyReportBuilder:
                 response_classes = ["response-token"]
                 if token_info['is_whitespace']:
                     response_classes.append("whitespace")
+                category = token_info.get('category', 'text')
+                if category == 'code':
+                    response_classes.append('code')
+                elif category == 'code-fence':
+                    response_classes.append('code-fence')
+                elif category == 'special':
+                    response_classes.append('special')
                 handle.write(
                     f"<span class='{' '.join(response_classes)}' data-entropy='{token_info['entropy_attr']}' "
+                    f"data-category='{category}' "
                     f"style='{token_info['chip_style']}' title='{escape(token_info['title_attr'])}'>"
                     f"{token_info['response_text']}{token_info['tooltip_html']}</span>"
                 )

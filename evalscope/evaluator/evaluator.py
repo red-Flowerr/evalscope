@@ -161,6 +161,12 @@ class DefaultEvaluator(Evaluator):
         logger.info(f'Getting reviews for subset: {subset}')
         sample_scores = self.get_reviews(subset, task_states)
 
+        if self._entropy_reporter:
+            try:
+                self._entropy_reporter.update_scores(subset, sample_scores)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f'Failed to attach scores to entropy report: {exc}')
+
         # Aggregate individual sample scores into subset-level metrics
         logger.info(f'Aggregating scores for subset: {subset}')
         agg_scores = self.benchmark.aggregate_scores(sample_scores=sample_scores)
